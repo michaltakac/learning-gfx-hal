@@ -1,0 +1,25 @@
+[package]
+name = "learning-gfx-hal"
+version = "0.1.0"
+authors = ["Michal Takac <takacmichal92@gmail.com>"]
+edition = "2018"
+
+[dependencies]
+bincode = "1.3.1"
+gfx-hal = "0.6.0"
+image = "0.23.11"
+serde = { version = "1.0.117", features = ["derive"] }
+shaderc = "0.6.3"
+winit = "0.23.0"
+
+[target.'cfg(target_os = "macos")'.dependencies.gfx_backend]
+package = "gfx-backend-metal"
+version = "=0.6.2"
+
+[target.'cfg(windows)'.dependencies.gfx_backend]
+package = "gfx-backend-dx12"
+version = "=0.6.3"
+
+[target.'cfg(all(unix, not(target_os = "macos")))'.dependencies.gfx_backend]
+package = "gfx-backend-vulkan"
+version = "=0.6.1"
