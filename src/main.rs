@@ -28,8 +28,23 @@ use gfx_hal::{
 };
 use shaderc::ShaderKind;
 
+// We defined the PushConstants struct in our shader where we were just asking it to interpret
+// some of those bytes as a struct. We do the same in our Rust code to make it easier to send that data.
+
+// The repr(C) attribute which tells the compiler to lay out this struct in memory the way C would.
+// This is also (close to) how structs are laid out in shader code.
+// By ensuring the layouts are the same, we can easily copy the Rust struct straight into push
+// constants without worrying about individual fields.
+#[repr(C)]
+#[derive(Debug, Clone, Copy)]
+struct PushConstants {
+    color: [f32; 4],
+    pos: [f32; 2],
+    scale: [f32; 2],
+}
+
 fn main() {
-    const APP_NAME: &'static str = "Part 1: Drawing a triangle";
+    const APP_NAME: &'static str = "Part 2: Push constants";
     const WINDOW_SIZE: [u32; 2] = [512, 512];
 
     let event_loop = winit::event_loop::EventLoop::new();
@@ -183,16 +198,23 @@ fn main() {
     };
 
     let pipeline_layout = unsafe {
+        use gfx_hal::pso::ShaderStageFlags;
+
+        // The GPU doesn’t know anything about structs - all it knows is that we’re going to give it some bytes.
+        // What it wants to know is which of those bytes it should use for each specific shader stage.
+        // In our case, we only care about the vertex shader, and the number of bytes is however big the struct is.
+        let push_constant_bytes = std::mem::size_of::<PushConstants>() as u32;
+
         device
-            .create_pipeline_layout(&[], &[])
+            .create_pipeline_layout(&[], &[(ShaderStageFlags::VERTEX, 0..push_constant_bytes)])
             .expect("Out of memory")
     };
 
     // Vertex and fragment shaders.
     // these shaders are written in GLSL - which gfx-hal doesn’t support directly.
     // To use them, we’ll have to first compile them to SPIR-V - a more efficient intermediate representation.
-    let vertex_shader = include_str!("shaders/part-1.vert");
-    let fragment_shader = include_str!("shaders/part-1.frag");
+    let vertex_shader = include_str!("shaders/part-2.vert");
+    let fragment_shader = include_str!("shaders/part-2.frag");
 
     fn compile_shader(glsl: &str, shader_kind: ShaderKind) -> Vec<u32> {
         let mut compiler = shaderc::Compiler::new().unwrap();
@@ -385,6 +407,9 @@ fn main() {
     // that we rebuild the swapchain on the first frame.
     let mut should_configure_swapchain = true;
 
+    // We'll use the elapsed time to drive some animations later on.
+    let start_time = std::time::Instant::now();
+
     // Note that this takes a `move` closure. This means it will take ownership
     // over any resources referenced within. It also means they will be dropped
     // only when the application is quit.
@@ -420,6 +445,7 @@ fn main() {
                 // --- Rendering
                 let res: &mut Resources<_> = &mut resource_holder.0;
                 let render_pass = &res.render_passes[0];
+                let pipeline_layout = &res.pipeline_layouts[0];
                 let pipeline = &res.pipelines[0];
 
                 // We’re about to reset our command buffer - which would be terrible if the commands
@@ -523,6 +549,65 @@ fn main() {
                     }
                 };
 
+                // --- Vertices on screen (forming triangles)
+
+                // This `anim` will be a number that oscillates smoothly
+                // between 0.0 and 1.0.
+                let anim = start_time.elapsed().as_secs_f32().sin() * 0.5 + 0.5;
+
+                let small = [0.33, 0.33];
+
+                let triangles = &[
+                    // Red triangle
+                    PushConstants {
+                        color: [1.0, 0.0, 0.0, 1.0],
+                        pos: [-0.5, -0.5],
+                        scale: small,
+                    },
+                    // Green triangle
+                    PushConstants {
+                        color: [0.0, 1.0, 0.0, 1.0],
+                        pos: [0.0, -0.5],
+                        scale: small,
+                    },
+                    // Blue triangle
+                    PushConstants {
+                        color: [0.0, 0.0, 1.0, 1.0],
+                        pos: [0.5, -0.5],
+                        scale: small,
+                    },
+                    // Blue <-> cyan animated triangle
+                    PushConstants {
+                        color: [0.0, anim, 1.0, 1.0],
+                        pos: [-0.5, 0.5],
+                        scale: small,
+                    },
+                    // Down <-> up animated triangle
+                    PushConstants {
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        pos: [0.0, 0.5 - anim * 0.5],
+                        scale: small,
+                    },
+                    // Small <-> big animated triangle
+                    PushConstants {
+                        color: [1.0, 1.0, 1.0, 1.0],
+                        pos: [0.5, 0.5],
+                        scale: [0.33 + anim * 0.33, 0.33 + anim * 0.33],
+                    },
+                ];
+
+                // Returns a view of a struct as a slice of `u32`s.
+                //
+                // Note that this assumes the struct divides evenly into
+                // 4-byte chunks. If the contents are all `f32`s, which they
+                // often are, then this will always be the case.
+                unsafe fn push_constant_bytes<T>(push_constants: &T) -> &[u32] {
+                    let size_in_bytes = std::mem::size_of::<T>();
+                    let size_in_u32s = size_in_bytes / std::mem::size_of::<u32>();
+                    let start_ptr = push_constants as *const T as *const u32;
+                    std::slice::from_raw_parts(start_ptr, size_in_u32s)
+                }
+
                 // --- Graphics commands
 
                 unsafe {
@@ -552,9 +637,19 @@ fn main() {
                     // with the settings and shaders of that pipeline
                     command_buffer.bind_graphics_pipeline(pipeline);
                     // Now the actual draw call itself. We’ve already bound everything we need.
-                    // Our shaders even take care of the vertex positions, so all we need to tell
-                    // the GPU is: “draw vertices 0..3 (0, 1, and 2) as a triangle”.
-                    command_buffer.draw(0..3, 0..1);
+                    // Our shaders even take care of the vertex positions.
+                    for triangle in triangles {
+                        use gfx_hal::pso::ShaderStageFlags;
+
+                        command_buffer.push_graphics_constants(
+                            pipeline_layout,
+                            ShaderStageFlags::VERTEX,
+                            0,
+                            push_constant_bytes(triangle),
+                        );
+
+                        command_buffer.draw(0..3, 0..1);
+                    }
                     // Then finally, we can end the render pass, and our command buffer
                     command_buffer.end_render_pass();
                     command_buffer.finish();
