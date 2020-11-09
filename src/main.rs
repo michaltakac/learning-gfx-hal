@@ -38,13 +38,21 @@ use shaderc::ShaderKind;
 #[repr(C)]
 #[derive(Debug, Clone, Copy)]
 struct PushConstants {
-    color: [f32; 4],
-    pos: [f32; 2],
-    scale: [f32; 2],
+    transform: [[f32; 4]; 4],
+}
+
+// In the repo is a mesh of the Utah teapot, serialized with the bincode crate.
+// Really it’s just a Vec of vertices efficiently packed into a binary file.
+// To deserialize it, we’ll need to define a compatible Vertex struct:
+#[derive(serde::Deserialize)]
+#[repr(C)]
+struct Vertex {
+    position: [f32; 3],
+    normal: [f32; 3],
 }
 
 fn main() {
-    const APP_NAME: &'static str = "Part 2: Push constants";
+    const APP_NAME: &'static str = "Part 3: Vertex buffers";
     const WINDOW_SIZE: [u32; 2] = [512, 512];
 
     let event_loop = winit::event_loop::EventLoop::new();
@@ -213,8 +221,8 @@ fn main() {
     // Vertex and fragment shaders.
     // these shaders are written in GLSL - which gfx-hal doesn’t support directly.
     // To use them, we’ll have to first compile them to SPIR-V - a more efficient intermediate representation.
-    let vertex_shader = include_str!("shaders/part-2.vert");
-    let fragment_shader = include_str!("shaders/part-2.frag");
+    let vertex_shader = include_str!("shaders/part-3.vert");
+    let fragment_shader = include_str!("shaders/part-3.frag");
 
     fn compile_shader(glsl: &str, shader_kind: ShaderKind) -> Vec<u32> {
         let mut compiler = shaderc::Compiler::new().unwrap();
@@ -264,13 +272,40 @@ fn main() {
         // This describes how our pipeline should take in vertices and output primitives (in our case, triangles).
         // It says we want to render our vertices as a list of triangles, and we pass the vertex shader
         // entry point we prepared.
-        let primitive_assembler = PrimitiveAssemblerDesc::Vertex {
-            buffers: &[],
-            attributes: &[],
-            input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
-            vertex: vs_entry,
-            tessellation: None,
-            geometry: None,
+        let primitive_assembler = {
+            use gfx_hal::format::Format;
+            use gfx_hal::pso::{AttributeDesc, Element, VertexBufferDesc, VertexInputRate};
+
+            PrimitiveAssemblerDesc::Vertex {
+                buffers: &[VertexBufferDesc {
+                    binding: 0,
+                    stride: std::mem::size_of::<Vertex>() as u32,
+                    rate: VertexInputRate::Vertex,
+                }],
+
+                attributes: &[
+                    AttributeDesc {
+                        location: 0,
+                        binding: 0,
+                        element: Element {
+                            format: Format::Rgb32Sfloat,
+                            offset: 0,
+                        },
+                    },
+                    AttributeDesc {
+                        location: 1,
+                        binding: 0,
+                        element: Element {
+                            format: Format::Rgb32Sfloat,
+                            offset: 12,
+                        },
+                    },
+                ],
+                input_assembler: InputAssemblerDesc::new(Primitive::TriangleList),
+                vertex: vs_entry,
+                tessellation: None,
+                geometry: None,
+            }
         };
 
         let mut pipeline_desc = GraphicsPipelineDesc::new(
@@ -324,6 +359,68 @@ fn main() {
     // In our case we’re going to use it to tell the GPU to wait until the frame has finished rendering before displaying it onscreen.
     let rendering_complete_semaphore = device.create_semaphore().expect("Out of memory");
 
+    // ---------------
+
+    // The `teapot_mesh.bin` is just a `Vec<Vertex>` that was serialized
+    // using the `bincode` crate. So we can deserialize it directly.
+    let binary_mesh_data = include_bytes!("./assets/teapot_mesh.bin");
+    let mesh: Vec<Vertex> =
+        bincode::deserialize(binary_mesh_data).expect("Failed to deserialize mesh");
+
+    // Create an empty buffer with the given size and properties.
+    unsafe fn make_buffer<B: gfx_hal::Backend>(
+        device: &B::Device,
+        physical_device: &B::PhysicalDevice,
+        buffer_len: usize,
+        usage: gfx_hal::buffer::Usage,
+        properties: gfx_hal::memory::Properties,
+    ) -> (B::Memory, B::Buffer) {
+        use gfx_hal::{adapter::PhysicalDevice, MemoryTypeId};
+
+        let mut buffer = device
+            .create_buffer(buffer_len as u64, usage)
+            .expect("Failed to create buffer");
+
+        let req = device.get_buffer_requirements(&buffer);
+
+        let memory_types = physical_device.memory_properties().memory_types;
+
+        let memory_type = memory_types
+            .iter()
+            .enumerate()
+            .find(|(id, mem_type)| {
+                let type_supported = req.type_mask & (1_u32 << id) != 0;
+                type_supported && mem_type.properties.contains(properties)
+            })
+            .map(|(id, _ty)| MemoryTypeId(id))
+            .expect("No compatible memory type available");
+
+        let buffer_memory = device
+            .allocate_memory(memory_type, req.size)
+            .expect("Failed to allocate buffer memory");
+
+        device
+            .bind_buffer_memory(&buffer_memory, 0, &mut buffer)
+            .expect("Failed to bind buffer memory");
+
+        (buffer_memory, buffer)
+    }
+
+    let vertex_buffer_len = mesh.len() * std::mem::size_of::<Vertex>();
+
+    let (vertex_buffer_memory, vertex_buffer) = unsafe {
+        use gfx_hal::buffer::Usage;
+        use gfx_hal::memory::Properties;
+
+        make_buffer::<gfx_backend::Backend>(
+            &device,
+            &adapter.physical_device,
+            vertex_buffer_len,
+            Usage::VERTEX,
+            Properties::CPU_VISIBLE,
+        )
+    };
+
     // --- Memory management
 
     // here’s the part that sucks: we have to clean up after ourselves.
@@ -342,6 +439,8 @@ fn main() {
         command_pool: B::CommandPool,
         submission_complete_fence: B::Fence,
         rendering_complete_semaphore: B::Semaphore,
+        vertex_buffer_memory: B::Memory,
+        vertex_buffer: B::Buffer,
     }
 
     // Unfortunately, we can’t implement Drop for this struct directly. This is because the signature
@@ -365,6 +464,8 @@ fn main() {
                     pipelines,
                     submission_complete_fence,
                     rendering_complete_semaphore,
+                    vertex_buffer_memory,
+                    vertex_buffer,
                 } = ManuallyDrop::take(&mut self.0);
 
                 device.destroy_semaphore(rendering_complete_semaphore);
@@ -379,13 +480,30 @@ fn main() {
                     device.destroy_render_pass(render_pass);
                 }
                 device.destroy_command_pool(command_pool);
+                device.free_memory(vertex_buffer_memory);
+                device.destroy_buffer(vertex_buffer);
                 surface.unconfigure_swapchain(&device);
-                match instance {
-                    Some(i) => i.destroy_surface(surface),
-                    None => (),
-                };
+                instance
+                    .expect("Instance was not initialized.")
+                    .destroy_surface(surface);
             }
         }
+    }
+
+    unsafe {
+        use gfx_hal::memory::Segment;
+
+        let mapped_memory = device
+            .map_memory(&vertex_buffer_memory, Segment::ALL)
+            .expect("Failed to map memory");
+
+        std::ptr::copy_nonoverlapping(mesh.as_ptr() as *const u8, mapped_memory, vertex_buffer_len);
+
+        device
+            .flush_mapped_memory_ranges(vec![(&vertex_buffer_memory, Segment::ALL)])
+            .expect("Out of memory");
+
+        device.unmap_memory(&vertex_buffer_memory);
     }
 
     let mut resource_holder: ResourceHolder<gfx_backend::Backend> =
@@ -399,6 +517,8 @@ fn main() {
             pipelines: vec![pipeline],
             submission_complete_fence,
             rendering_complete_semaphore,
+            vertex_buffer_memory,
+            vertex_buffer,
         }));
 
     // --- Rendering
@@ -409,6 +529,20 @@ fn main() {
 
     // We'll use the elapsed time to drive some animations later on.
     let start_time = std::time::Instant::now();
+
+    // Create a matrix that positions, scales, and rotates.
+    fn make_transform(translate: [f32; 3], angle: f32, scale: f32) -> [[f32; 4]; 4] {
+        let c = angle.cos() * scale;
+        let s = angle.sin() * scale;
+        let [dx, dy, dz] = translate;
+
+        [
+            [c, 0., s, 0.],
+            [0., scale, 0., 0.],
+            [-s, 0., c, 0.],
+            [dx, dy, dz, 1.],
+        ]
+    }
 
     // Note that this takes a `move` closure. This means it will take ownership
     // over any resources referenced within. It also means they will be dropped
@@ -557,44 +691,11 @@ fn main() {
 
                 let small = [0.33, 0.33];
 
-                let triangles = &[
-                    // Red triangle
-                    PushConstants {
-                        color: [1.0, 0.0, 0.0, 1.0],
-                        pos: [-0.5, -0.5],
-                        scale: small,
-                    },
-                    // Green triangle
-                    PushConstants {
-                        color: [0.0, 1.0, 0.0, 1.0],
-                        pos: [0.0, -0.5],
-                        scale: small,
-                    },
-                    // Blue triangle
-                    PushConstants {
-                        color: [0.0, 0.0, 1.0, 1.0],
-                        pos: [0.5, -0.5],
-                        scale: small,
-                    },
-                    // Blue <-> cyan animated triangle
-                    PushConstants {
-                        color: [0.0, anim, 1.0, 1.0],
-                        pos: [-0.5, 0.5],
-                        scale: small,
-                    },
-                    // Down <-> up animated triangle
-                    PushConstants {
-                        color: [1.0, 1.0, 1.0, 1.0],
-                        pos: [0.0, 0.5 - anim * 0.5],
-                        scale: small,
-                    },
-                    // Small <-> big animated triangle
-                    PushConstants {
-                        color: [1.0, 1.0, 1.0, 1.0],
-                        pos: [0.5, 0.5],
-                        scale: [0.33 + anim * 0.33, 0.33 + anim * 0.33],
-                    },
-                ];
+                let angle = start_time.elapsed().as_secs_f32();
+
+                let teapots = &[PushConstants {
+                    transform: make_transform([0., 0., 0.5], angle, 1.0),
+                }];
 
                 // Returns a view of a struct as a slice of `u32`s.
                 //
@@ -621,6 +722,11 @@ fn main() {
                     command_buffer.set_viewports(0, &[viewport.clone()]);
                     command_buffer.set_scissors(0, &[viewport.rect]);
 
+                    command_buffer.bind_vertex_buffers(
+                        0,
+                        vec![(&res.vertex_buffer, gfx_hal::buffer::SubRange::WHOLE)],
+                    );
+
                     // Next we begin the render pass. We tell it to clear the color attachment to black before rendering
                     command_buffer.begin_render_pass(
                         render_pass,
@@ -637,18 +743,18 @@ fn main() {
                     // with the settings and shaders of that pipeline
                     command_buffer.bind_graphics_pipeline(pipeline);
                     // Now the actual draw call itself. We’ve already bound everything we need.
-                    // Our shaders even take care of the vertex positions.
-                    for triangle in triangles {
+                    for teapot in teapots {
                         use gfx_hal::pso::ShaderStageFlags;
 
                         command_buffer.push_graphics_constants(
                             pipeline_layout,
                             ShaderStageFlags::VERTEX,
                             0,
-                            push_constant_bytes(triangle),
+                            push_constant_bytes(teapot),
                         );
 
-                        command_buffer.draw(0..3, 0..1);
+                        let vertex_count = mesh.len() as u32;
+                        command_buffer.draw(0..vertex_count, 0..1);
                     }
                     // Then finally, we can end the render pass, and our command buffer
                     command_buffer.end_render_pass();
