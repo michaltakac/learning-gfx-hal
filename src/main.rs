@@ -683,13 +683,7 @@ fn main() {
                     }
                 };
 
-                // --- Vertices on screen (forming triangles)
-
-                // This `anim` will be a number that oscillates smoothly
-                // between 0.0 and 1.0.
-                let anim = start_time.elapsed().as_secs_f32().sin() * 0.5 + 0.5;
-
-                let small = [0.33, 0.33];
+                // --- Vertices on screen (forming teapot)
 
                 let angle = start_time.elapsed().as_secs_f32();
 
